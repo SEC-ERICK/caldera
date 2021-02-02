@@ -113,7 +113,6 @@ class DnsPacket:
         num_auth_rrs = int.from_bytes(data[8:10], byteorder=byteorder)
         num_additional_rrs = int.from_bytes(data[10:12], byteorder=byteorder)
         qname_labels, qname_length = DnsPacket._parse_qname_labels(data[12:])
-        print('qname length: %d' % qname_length)
         qname_offset = 12 + qname_length
         record_type = DnsRecordType(int.from_bytes(data[qname_offset:qname_offset+2], byteorder=byteorder))
         dns_class = int.from_bytes(data[qname_offset+2:qname_offset+4], byteorder=byteorder)
@@ -344,7 +343,7 @@ class Handler(asyncio.DatagramProtocol):
         async def handle_msg():
             try:
                 packet = DnsPacket.generate_packet_from_bytes(data)
-                self.log.debug('Received DNS request: %s' % str(packet))
+                self.log.debug('Received %s DNS request: %s' % (packet.record_type.name, packet.qname))
                 await self._handle_dns_request(packet, addr)
             except Exception as e:
                 self.log.error(e)
@@ -374,6 +373,7 @@ class Handler(asyncio.DatagramProtocol):
         if dns_request_packet.record_type not in (DnsRecordType.A, DnsRecordType.TXT):
             self.log.warn('Received unsupported DNS record type request %d' % dns_request_packet.record_type.value)
             self._send_empty_response(dns_request_packet, addr)
+            return
 
         message_id = labels[0]
         try:
@@ -404,8 +404,8 @@ class Handler(asyncio.DatagramProtocol):
 
     def _send_dns_response(self, dns_response_obj, addr):
         """Send the given DnsResponse object to the specified address."""
-        self.log.debug('Sending DNS response:')
-        self.log.debug(str(dns_response_obj))
+        #self.log.debug('Sending DNS response:')
+        #self.log.debug(str(dns_response_obj))
         response_bytes = dns_response_obj.get_bytes()
         self.transport.sendto(response_bytes, addr)
 
@@ -418,8 +418,6 @@ class Handler(asyncio.DatagramProtocol):
         msg = self.completed_messages.pop(message_id, None)
         if msg:
             contents = msg.export_contents()
-            self.log.debug('Received completed message %s with contents %s' % (message_id, contents.hex()))
-
             request_context = self.ClientRequestContext(message_id, dns_request_packet, contents, addr)
 
             # Process message based on message type
@@ -451,6 +449,7 @@ class Handler(asyncio.DatagramProtocol):
 
                     # Notify agent that payload is ready
                     self._notify_server_ready_via_ipv4(request_context.dns_request, request_context.client_addr)
+                    self.log.debug('Stored payload %s for request ID %s' % (display_name, request_context.request_id))
                     return
             else:
                 self.log.warn('Client did not include filename in payload request ID %s' % request_context.request_id)
@@ -474,19 +473,19 @@ class Handler(asyncio.DatagramProtocol):
             self._send_nxdomain_response(request_context.dns_request, request_context.client_addr)
         else:
             self.log.debug('Client requested %s via message ID %s' % (data_type, request_context.request_id))
-            stored_instructions = data_repo.get(request_context.request_id)
-            if stored_instructions:
-                self._send_data_chunk_via_txt(request_context, stored_instructions)
+            stored_response = data_repo.get(request_context.request_id)
+            if stored_response:
+                self._send_data_chunk_via_txt(data_repo, request_context, stored_response)
             else:
                 self.log.warn('No %s found for message ID %s' % (data_type, request_context.request_id))
                 self._send_nxdomain_response(request_context.dns_request, request_context.client_addr)
 
-    def _send_data_chunk_via_txt(self, request_context, stored_response):
+    def _send_data_chunk_via_txt(self, data_repo, request_context, stored_response):
         data = bytearray(stored_response.read_data(DnsResponse.max_txt_size - 1))
         if stored_response.finished_reading():
             # This is the last data chunk to send.
             data.append(self._completed_data_suffix)
-            self.pending_instructions.pop(request_context.request_id)
+            data_repo.pop(request_context.request_id)
         else:
             data.append(self._remaining_data_suffix)
         self._send_txt_response(request_context.dns_request, data, DnsResponse.default_ttl, request_context.client_addr)
@@ -494,7 +493,6 @@ class Handler(asyncio.DatagramProtocol):
     async def _process_beacon(self, request_context):
         profile = self._unpack_json(request_context.request_contents)
         if profile:
-            self.log.debug('Received profile from beacon message ID %s: %s' % (request_context.request_id, profile))
             profile['paw'] = profile.get('paw')
             profile['contact'] = profile.get('contact', self.name)
             beacon_response = await self._get_beacon_response(profile)
@@ -520,7 +518,6 @@ class Handler(asyncio.DatagramProtocol):
 
     def _store_beacon_response(self, beacon_id, response_dict):
         # Convert response_dict to json bytes
-        self.log.debug('Storing beacon response for beacon ID %s: %s' % (beacon_id, response_dict))
         response_bytes = b64encode(json.dumps(response_dict).encode('utf-8'))
         self.pending_instructions[beacon_id] = self.StoredResponse(response_bytes)
 
