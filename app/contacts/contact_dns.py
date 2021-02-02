@@ -118,7 +118,7 @@ class DnsPacket:
         record_type = DnsRecordType(int.from_bytes(data[qname_offset:qname_offset+2], byteorder=byteorder))
         dns_class = int.from_bytes(data[qname_offset+2:qname_offset+4], byteorder=byteorder)
         return DnsPacket(transaction_id, flags, num_questions, num_answer_rrs, num_auth_rrs, num_additional_rrs,
-                 qname_labels, record_type, dns_class)
+                         qname_labels, record_type, dns_class)
 
     @staticmethod
     def _get_qname_bytes(qname_labels, byteorder='big'):
@@ -166,6 +166,7 @@ class DnsAnswerObj:
             'Data length: %d' % len(self.data),
         ])
 
+
 class DnsResponse(DnsPacket):
     standard_pointer = 0xc00c
     max_txt_size = 255
@@ -176,7 +177,7 @@ class DnsResponse(DnsPacket):
     def __init__(self, transaction_id, flags, num_questions, num_answer_rrs, num_auth_rrs, num_additional_rrs,
                  qname_labels, record_type, dns_class, answers):
         super().__init__(transaction_id, flags, num_questions, num_answer_rrs, num_auth_rrs, num_additional_rrs,
-                 qname_labels, record_type, dns_class)
+                         qname_labels, record_type, dns_class)
         self.answers = answers if answers else []
 
     def get_bytes(self, byteorder='big'):
@@ -235,13 +236,15 @@ class DnsResponse(DnsPacket):
         record_type = dns_query.record_type
         dns_class = dns_query.dns_class
         return DnsResponse(transaction_id, flags, num_questions, num_answers, num_auth_rrs, num_additional_rrs,
-                 qname_labels, record_type, dns_class, answers)
+                           qname_labels, record_type, dns_class, answers)
 
 
 class DnsRecordType(Enum):
     A = 1
     NS = 2
     TXT = 16
+    AAAA = 28
+    CNAME = 5
 
 
 class DnsResponseCodes(Enum):
@@ -250,6 +253,9 @@ class DnsResponseCodes(Enum):
 
 
 class Handler(asyncio.DatagramProtocol):
+    _remaining_data_suffix = 0x2e  # .
+    _completed_data_suffix = 0x2c  # ,
+
     class MessageType(Enum):
         Beacon = 'be'  # Beacons will also contain execution results
         InstructionDownload = 'id'
@@ -359,11 +365,15 @@ class Handler(asyncio.DatagramProtocol):
         labels = dns_request_packet.qname_labels
         if dns_request_packet.qname.lower() != self.domain.lower() \
                 and not dns_request_packet.qname.lower().endswith('.' + self.domain.lower()):
-            self.log.warn('Received request for qname %s that is not the C2 DNS tunneling domain %s'
-                  % (dns_request_packet.qname, self.domain))
+            self.log.warn('Received request for qname %s that is not the C2 DNS tunneling domain %s' %
+                          (dns_request_packet.qname, self.domain))
             self.log.warn('Sending NXDOMAIN response.')
             self._send_nxdomain_response(dns_request_packet, addr)
             return
+
+        if dns_request_packet.record_type not in (DnsRecordType.A, DnsRecordType.TXT):
+            self.log.warn('Received unsupported DNS record type request %d' % dns_request_packet.record_type.value)
+            self._send_empty_response(dns_request_packet, addr)
 
         message_id = labels[0]
         try:
@@ -386,6 +396,10 @@ class Handler(asyncio.DatagramProtocol):
 
     def _send_nxdomain_response(self, dns_query, addr):
         response_obj = DnsResponse.generate_response_for_query(dns_query, DnsResponseCodes.NXDOMAIN, [])
+        self._send_dns_response(response_obj, addr)
+
+    def _send_empty_response(self, dns_query, addr):
+        response_obj = DnsResponse.generate_response_for_query(dns_query, DnsResponseCodes.SUCCESS, [])
         self._send_dns_response(response_obj, addr)
 
     def _send_dns_response(self, dns_response_obj, addr):
@@ -427,11 +441,12 @@ class Handler(asyncio.DatagramProtocol):
         if payload_metadata:
             filename = payload_metadata.get('file')
             if filename:
-                payload, content, display_name = await self.file_svc.get_file(payload_metadata)
+                payload, content, display_name = await self._fetch_payload(payload_metadata)
                 if payload and content and display_name:
                     # Save file contents and payload name for agent to fetch later.
                     encoded_payload_name = b64encode(display_name.encode('utf-8'))
-                    self.pending_payloads[request_context.request_id] = self.StoredResponse(content)
+                    encoded_contents = b64encode(content)
+                    self.pending_payloads[request_context.request_id] = self.StoredResponse(encoded_contents)
                     self.pending_payload_names[request_context.request_id] = self.StoredResponse(encoded_payload_name)
 
                     # Notify agent that payload is ready
@@ -443,7 +458,7 @@ class Handler(asyncio.DatagramProtocol):
             self.log.warn('Empty payload request received from message ID %s' % request_context.request_id)
         self._send_nxdomain_response(request_context.dns_request, request_context.client_addr)
 
-    async def _fetch_payload(self, request_context, payload_metadata):
+    async def _fetch_payload(self, payload_metadata):
         try:
             return await self.file_svc.get_file(payload_metadata)
         except FileNotFoundError:
@@ -467,14 +482,14 @@ class Handler(asyncio.DatagramProtocol):
                 self._send_nxdomain_response(request_context.dns_request, request_context.client_addr)
 
     def _send_data_chunk_via_txt(self, request_context, stored_response):
-        data = stored_response.read_data(DnsResponse.max_txt_size)
+        data = bytearray(stored_response.read_data(DnsResponse.max_txt_size - 1))
         if stored_response.finished_reading():
             # This is the last data chunk to send.
-            ttl = self._generate_random_txt_ttl(False)
+            data.append(self._completed_data_suffix)
             self.pending_instructions.pop(request_context.request_id)
         else:
-            ttl = self._generate_random_txt_ttl(True)
-        self._send_txt_response(request_context.dns_request, data, ttl, request_context.client_addr)
+            data.append(self._remaining_data_suffix)
+        self._send_txt_response(request_context.dns_request, data, DnsResponse.default_ttl, request_context.client_addr)
 
     async def _process_beacon(self, request_context):
         profile = self._unpack_json(request_context.request_contents)
@@ -581,12 +596,3 @@ class Handler(asyncio.DatagramProtocol):
             return random_bytes[0:3] + last_octet.to_bytes(1, byteorder='big')
         else:
             return random_bytes
-
-    @staticmethod
-    def _generate_random_txt_ttl(even_ttl):
-        """Generate random TTL value for TXT record response.
-        If even_ttl is true, make sure the TTL is even. Otherwise, make sure it is odd"""
-        value = random.randint(DnsResponse.min_ttl, DnsResponse.max_ttl)
-        if (value % 2 == 0 and not even_ttl) or (value % 2 == 1 and even_ttl):
-            value = value + 1 if value == DnsResponse.min_ttl else value - 1
-        return value
