@@ -370,7 +370,10 @@ class Handler(asyncio.DatagramProtocol):
             self._send_nxdomain_response(dns_request_packet, addr)
             return
 
-        if dns_request_packet.record_type not in (DnsRecordType.A, DnsRecordType.TXT):
+        if dns_request_packet.record_type == DnsRecordType.AAAA:
+            self._send_dummy_ipv6_response(dns_request_packet, addr)
+            return
+        elif dns_request_packet.record_type not in (DnsRecordType.A, DnsRecordType.TXT):
             self.log.warn('Received unsupported DNS record type request %d' % dns_request_packet.record_type.value)
             self._send_empty_response(dns_request_packet, addr)
             return
@@ -402,10 +405,15 @@ class Handler(asyncio.DatagramProtocol):
         response_obj = DnsResponse.generate_response_for_query(dns_query, DnsResponseCodes.SUCCESS, [])
         self._send_dns_response(response_obj, addr)
 
+    def _send_dummy_ipv6_response(self, dns_request_packet, addr):
+        ipv6_bytes = self._generate_dummy_ipv6_response()
+        answer_obj = DnsAnswerObj(DnsRecordType.AAAA, dns_request_packet.dns_class, DnsResponse.default_ttl, ipv6_bytes)
+        response_obj = DnsResponse.generate_response_for_query(dns_request_packet, DnsResponseCodes.SUCCESS,
+                                                               [answer_obj])
+        self._send_dns_response(response_obj, addr)
+
     def _send_dns_response(self, dns_response_obj, addr):
         """Send the given DnsResponse object to the specified address."""
-        #self.log.debug('Sending DNS response:')
-        #self.log.debug(str(dns_response_obj))
         response_bytes = dns_response_obj.get_bytes()
         self.transport.sendto(response_bytes, addr)
 
@@ -593,3 +601,7 @@ class Handler(asyncio.DatagramProtocol):
             return random_bytes[0:3] + last_octet.to_bytes(1, byteorder='big')
         else:
             return random_bytes
+
+    @staticmethod
+    def _generate_dummy_ipv6_response():
+        return random.randbytes(16)
